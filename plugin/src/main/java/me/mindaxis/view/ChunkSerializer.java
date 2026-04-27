@@ -24,7 +24,7 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 /**
- * Serializes a ChunkSnapshot into subchunk messages matching the Bedrock viewer
+ * Serializes a ChunkSnapshot into subchunk messages matching the viewer bridge
  * bridge format: palette + base64 indices per 16x16x16 section.
  *
  * When running on Paper, palette entries include "sid" (Java protocol stateId)
@@ -295,7 +295,7 @@ public class ChunkSerializer {
     private static String serializeSection(ChunkSnapshot snapshot, int chunkX, int chunkZ, int sectionY) {
         int baseY = sectionY * 16;
 
-        // Build palette and indices in XZY order (matching Bedrock bridge)
+        // Build palette and indices in XZY order (matching bridge format)
         Map<String, Integer> paletteMap = new LinkedHashMap<>();
         List<PaletteEntry> paletteList = new ArrayList<>();
         int[] indices = new int[4096];

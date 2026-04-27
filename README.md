@@ -15,7 +15,6 @@ mineflayer emulates a full MC client: protocol encryption, packet parsing, world
 | Player slots | 1 per bot | 0 |
 | Event loop impact | High (sync packet parse) | Minimal (pre-formatted data) |
 | Server permission | None needed (connects like a player) | Plugin installed (server-authorized) |
-| Bedrock Realm | Not supported | Supported (NETHERNET) |
 
 ## Architecture
 
@@ -99,11 +98,6 @@ await link.connect();
 - **Shared Memory** (`/dev/shm`) — Sub-millisecond local IPC
 - Auto-reconnect with exponential backoff
 
-### Bedrock Realm Support
-- Connect to Bedrock Realms via NETHERNET
-- Same event format as Java plugin
-- TP and camera commands
-
 ## Plugin Commands
 
 ```
@@ -138,8 +132,7 @@ max-history: 2048
 
 ## Supported Versions
 
-- **Java Edition**: Paper/Spigot 1.21.x
-- **Bedrock Edition**: Realms (via NETHERNET bot)
+- Paper/Spigot 1.21.x
 
 ## License
 

@@ -1,7 +1,7 @@
 {
   "name": "craftlink",
   "version": "0.1.0",
-  "description": "Real-time Minecraft server data API — plugin + bridge for Java & Bedrock",
+  "description": "Real-time Minecraft server data API — plugin + bridge for Java Edition",
   "main": "bridge/index.js",
   "types": "bridge/index.d.ts",
   "scripts": {
@@ -16,8 +16,7 @@
     "viewer",
     "realtime",
     "websocket",
-    "bedrock",
-    "realm"
+    "paper"
   ],
   "author": "MindAxis <satori@mindaxis.me>",
   "license": "MIT",
