@@ -1,0 +1,14 @@
+name: MindAxisView
+version: '${version}'
+main: me.mindaxis.view.MindAxisViewPlugin
+api-version: '1.21'
+description: Streams chunk data via WebSocket for the MindAxis viewer
+commands:
+  viewer:
+    description: Control the MindAxis viewer
+    usage: /viewer <start|stop|anchor|status> [player]
+    permission: mindaxisview.admin
+permissions:
+  mindaxisview.admin:
+    description: Allows use of the /viewer command
+    default: op

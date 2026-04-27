@@ -1,0 +1,30 @@
+# MindAxis View Plugin Configuration
+
+# WebSocket server port
+ws-port: 4800
+
+# Default anchor player (empty = first player to join)
+anchor-player: ""
+
+# Players whose surroundings should be streamed for multi-viewport.
+# ['*'] = every online player in the anchor player's world.
+tracked-players:
+  - "*"
+
+# View distance in chunks (how far around anchor to send)
+view-distance: 8
+
+# Position update interval in milliseconds
+position-interval-ms: 50
+
+# Max history buffer size (subchunks kept for late-joining clients)
+max-history: 2048
+
+# Optional bearer token required for bridge/WebSocket clients.
+auth-token: ""
+
+# Compress binary subchunk frames with gzip before WS broadcast.
+compress-binary-chunks: true
+
+# Keep local /dev/shm mirrors enabled for same-host acceleration.
+shm-enabled: true
