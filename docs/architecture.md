@@ -23,13 +23,13 @@ CraftLink removes almost all of that:
 
 ```mermaid
 flowchart LR
-  A[Paper / Spigot Server] --> B[CraftLink Plugin]
-  B --> C[/dev/shm mirrors]
-  B --> D[WebSocket server]
-  D --> E[CraftLink Node bridge]
-  E --> F[Bot]
-  E --> G[Viewer]
-  E --> H[Analytics / automation]
+  A["Paper / Spigot Server"] --> B["CraftLink Plugin"]
+  B --> C["Shared memory mirrors"]
+  B --> D["WebSocket server"]
+  D --> E["CraftLink Node bridge"]
+  E --> F["Bot"]
+  E --> G["Viewer"]
+  E --> H["Analytics / automation"]
 ```
 
 ## What CraftLink skips
