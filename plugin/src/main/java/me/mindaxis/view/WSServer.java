@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.logging.Logger;
 
@@ -33,6 +34,7 @@ public class WSServer extends WebSocketServer {
     private final ConcurrentHashMap<WebSocket, CopyOnWriteArrayList<PendingFrame>> pendingInitialFrames =
             new ConcurrentHashMap<>();
     private Consumer<WebSocket> onClientConnect;
+    private BiConsumer<WebSocket, String> onClientMessage;
 
     public WSServer(int port, int maxHistory, Logger logger, String authToken) {
         super(new InetSocketAddress(port));
@@ -60,6 +62,10 @@ public class WSServer extends WebSocketServer {
         this.onClientConnect = callback;
     }
 
+    public void setOnClientMessage(BiConsumer<WebSocket, String> callback) {
+        this.onClientMessage = callback;
+    }
+
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
         logger.info("[MindAxisView] WS client connected: " + conn.getRemoteSocketAddress()
@@ -79,7 +85,12 @@ public class WSServer extends WebSocketServer {
 
     @Override
     public void onMessage(WebSocket conn, String message) {
-        // No inbound messages expected in MVP
+        if (onClientMessage == null) return;
+        try {
+            onClientMessage.accept(conn, message);
+        } catch (Exception ex) {
+            logger.warning("[MindAxisView] WS message handler failed: " + ex.getMessage());
+        }
     }
 
     @Override

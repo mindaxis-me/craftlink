@@ -38,7 +38,7 @@ The plugin runs inside the server JVM with direct access to `ChunkSnapshot`, ent
 Download `craftlink-plugin.jar` from [Releases](https://github.com/mindaxis-me/craftlink/releases) and drop it in your server's `plugins/` folder.
 
 ```yaml
-# plugins/CraftLink/config.yml
+# plugins/MindAxisView/config.yml
 ws-port: 4800
 auth-token: "your-secret-token"
 compress-binary-chunks: true
@@ -56,29 +56,46 @@ npm install craftlink
 ```javascript
 const { CraftLink } = require('craftlink');
 
-const link = new CraftLink({
-  url: 'ws://your-server:4800',
-  token: 'your-secret-token',
-});
+async function main() {
+  const link = new CraftLink({
+    url: 'ws://your-server:4800',
+    token: 'your-secret-token',
+  });
 
-link.on('chunk', (chunk) => {
-  console.log(`Chunk ${chunk.x}, ${chunk.z}: ${chunk.sections.length} sections`);
-});
+  link.on('chunk', (chunk) => {
+    console.log(`Subchunk ${chunk.x}, ${chunk.y}, ${chunk.z}: ${chunk.palette.length} palette entries`);
+  });
 
-link.on('entity', (entity) => {
-  console.log(`${entity.name} at ${entity.x}, ${entity.y}, ${entity.z}`);
-});
+  link.on('entity', (entity) => {
+    console.log(`${entity.name} at ${entity.x}, ${entity.y}, ${entity.z}`);
+  });
 
-link.on('blockUpdate', (update) => {
-  console.log(`Block changed at ${update.x}, ${update.y}, ${update.z}`);
-});
+  link.on('blockUpdate', (update) => {
+    console.log(`Block changed at ${update.x}, ${update.y}, ${update.z}`);
+  });
 
-link.on('sound', (sound) => {
-  console.log(`${sound.name} at ${sound.x}, ${sound.y}, ${sound.z}`);
-});
+  link.on('raw', (msg) => {
+    if (msg.type === 'ready') {
+      console.log(`Initial snapshot ready: ${msg.chunkCount} chunk columns`);
+    }
+  });
 
-await link.connect();
+  await link.connect();
+}
+
+main().catch(console.error);
 ```
+
+## Documentation
+
+- [API Reference](./docs/api-reference.md)
+- [Plugin Guide](./docs/plugin-guide.md)
+- [Tutorial: Your First Bot](./docs/tutorial-first-bot.md)
+- [Tutorial: Build a Viewer](./docs/tutorial-viewer.md)
+- [Architecture](./docs/architecture.md)
+- [Wire Protocol](./docs/wire-protocol.md)
+- [Migration from mineflayer](./docs/migration-from-mineflayer.md)
+- [FAQ](./docs/faq.md)
 
 ## Features
 
@@ -105,6 +122,7 @@ await link.connect();
 /craftlink stop           — Stop WebSocket server
 /craftlink anchor <player> — Set camera anchor player
 /craftlink status         — Show connection stats
+/viewer ...               — Legacy alias
 ```
 
 ## Configuration

@@ -214,6 +214,7 @@ public class MindAxisViewPlugin extends JavaPlugin implements Listener {
                         anchorPlayer.getExp(), anchorPlayer.getLevel());
             });
         });
+        wsServer.setOnClientMessage((conn, message) -> handleWsClientMessage(message));
         wsServer.start();
 
         // Register event listeners
@@ -871,6 +872,39 @@ public class MindAxisViewPlugin extends JavaPlugin implements Listener {
         ready.addProperty("chunkCount", chunkCount);
         ready.addProperty("ts", System.currentTimeMillis());
         return ready.toString();
+    }
+
+    private void handleWsClientMessage(String message) {
+        if (message == null || message.isBlank()) return;
+
+        try {
+            JsonObject payload = com.google.gson.JsonParser.parseString(message).getAsJsonObject();
+            String type = payload.has("type") ? payload.get("type").getAsString() : "";
+            if (!"command".equals(type)) {
+                getLogger().warning("[MindAxisView] Ignoring unsupported WS message type: " + type);
+                return;
+            }
+
+            String command = payload.has("command") ? payload.get("command").getAsString().trim() : "";
+            if (command.isEmpty()) {
+                getLogger().warning("[MindAxisView] Ignoring empty WS command");
+                return;
+            }
+
+            if (command.startsWith("/")) {
+                command = command.substring(1);
+            }
+
+            final String finalCommand = command;
+            Bukkit.getScheduler().runTask(this, () -> {
+                boolean accepted = Bukkit.dispatchCommand(Bukkit.getConsoleSender(), finalCommand);
+                if (!accepted) {
+                    getLogger().warning("[MindAxisView] WS command was not accepted: " + finalCommand);
+                }
+            });
+        } catch (Exception e) {
+            getLogger().warning("[MindAxisView] Failed to parse WS client message: " + e.getMessage());
+        }
     }
 
     // ---- Shared-Memory Heightmap for Bot ----
