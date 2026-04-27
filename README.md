@@ -134,6 +134,8 @@ max-history: 2048
 
 - Paper/Spigot 1.21.x
 
+> **Bedrock Edition**: Bedrock Realm viewing is available as a managed service through [MindAxis View](https://view.mindaxis.me). Contact us for access.
+
 ## License
 
 MIT
