@@ -1,7 +1,10 @@
-# MindAxis View Plugin Configuration
+# CraftLink Configuration
 
 # WebSocket server port
 ws-port: 4800
+
+# Auto-start viewer streaming when the plugin enables.
+auto-start: true
 
 # Default anchor player (empty = first player to join)
 anchor-player: ""
@@ -26,5 +29,16 @@ auth-token: ""
 # Compress binary subchunk frames with gzip before WS broadcast.
 compress-binary-chunks: true
 
-# Keep local /dev/shm mirrors enabled for same-host acceleration.
-shm-enabled: true
+# Optional root directory for same-host shared-data mirrors and action IPC files.
+# Leave empty to use the plugin data folder. Set to /dev/shm/craftlink on Linux for tmpfs-backed IO.
+shared-data-root: ""
+
+# Enable filesystem mirrors for chunk/entity snapshots and file-based action IPC.
+shared-data-enabled: true
+
+# Full tracked-chunk shared-data refresh interval (ticks). 20 ticks = 1 second.
+shared-data-refresh-interval-ticks: 600
+
+portal:
+  enabled: true
+  token: ""

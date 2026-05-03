@@ -14,29 +14,25 @@ import org.bukkit.block.banner.Pattern;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.block.sign.Side;
 
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
-import java.util.zip.GZIPInputStream;
-import java.util.zip.GZIPOutputStream;
 
 /**
- * Serializes a ChunkSnapshot into subchunk messages matching the viewer bridge
- * bridge format: palette + base64 indices per 16x16x16 section.
+ * Serializes chunk data for the CraftLink viewer pipeline.
  *
- * When running on Paper, palette entries include "sid" (Java protocol stateId)
- * so the bridge can skip name-based translation entirely.
+ * Primary serialization paths:
+ * - {@link #serializeFullChunkDump} — prismarine-chunk dump() compatible binary frame
+ * - {@link #serializeToShm} — SHM file per chunk column for bot JS pathfinder
+ * - {@link #serializeHeightmap} — JSON heightmap message
+ * - {@link #serializeBlockEntities} — JSON block-entity message
  *
- * Message format (per subchunk):
- * {
- *   "type": "subchunk",
- *   "x": chunkX, "y": sectionIndex, "z": chunkZ,
- *   "palette": [{"index": 0, "name": "minecraft:stone", "sid": 1, "states": {...}}],
- *   "indices": "<base64>"
- * }
+ * When running on Paper, NMS stateId resolution is used (via reflection) so the
+ * viewer can interpret block states without name-based translation.
  */
 public class ChunkSerializer {
 
@@ -119,325 +115,315 @@ public class ChunkSerializer {
         }
     }
 
-    /**
-     * Serialize all non-empty sections of a chunk snapshot into JSON subchunk messages.
-     *
-     * @param snapshot the chunk snapshot (must be obtained on the main thread)
-     * @return list of JSON strings, one per non-empty subchunk
-     */
-    public static List<String> serialize(ChunkSnapshot snapshot) {
-        List<String> messages = new ArrayList<>();
-        int chunkX = snapshot.getX();
-        int chunkZ = snapshot.getZ();
-
-        // Paper/Spigot: world min height can be -64 (overworld) or 0 (nether/end)
-        // Sections are indexed: sectionY = (blockY - minY) / 16
-        // For overworld: minY = -64, sections from -4 to 19 (blockY -64 to 319)
-        // We iterate using block Y coordinates and derive section index
-        int minY = -64; // Overworld default; snapshot doesn't expose minY directly
-        int maxY = 320;
-
-        for (int sectionY = minY >> 4; sectionY < (maxY >> 4); sectionY++) {
-            String json = serializeSection(snapshot, chunkX, chunkZ, sectionY);
-            if (json != null) {
-                messages.add(json);
-            }
-        }
-        return messages;
-    }
-
-    /**
-     * Serialize per-section 4x4x4 biome data for a chunk snapshot.
-     *
-     * Message format (per section):
-     * {
-     *   "type": "biomes",
-     *   "x": chunkX, "y": sectionIndex, "z": chunkZ,
-     *   "biomes": [{"index": 0, "name": "minecraft:plains"}],
-     *   "biomeIndices": "<base64>"
-     * }
-     *
-     * Indices are encoded in XZY order at 4x4x4 biome resolution:
-     *   index = x + z*4 + y*16
-     */
-    public static List<String> serializeBiomes(ChunkSnapshot snapshot) {
-        List<String> messages = new ArrayList<>();
-        int chunkX = snapshot.getX();
-        int chunkZ = snapshot.getZ();
-        int minY = -64;
-        int maxY = 320;
-
-        for (int sectionY = minY >> 4; sectionY < (maxY >> 4); sectionY++) {
-            String json = serializeBiomeSection(snapshot, chunkX, chunkZ, sectionY);
-            if (json != null) {
-                messages.add(json);
-            }
-        }
-        return messages;
-    }
-
-    /**
-     * Binary header format (13 bytes):
-     *   byte 0:    type = 0x01 (subchunk binary)
-     *   bytes 1-4: chunkX (int32 LE)
-     *   bytes 5-8: chunkZ (int32 LE)
-     *   bytes 9-12: sectionY (int32 LE)
-     * Followed by:
-     *   4096 × int32 LE stateIds (16,384 bytes)
-     *   2048 bytes sky light nibble array (4-bit per block)
-     *   2048 bytes block light nibble array (4-bit per block)
-     * Total per section: 13 + 16384 + 2048 + 2048 = 20,493 bytes.
-     *
-     * Index order: for index i, x=(i>>8)&0xF, z=(i>>4)&0xF, y=i&0xF (XZY).
-     */
-    public static final int BINARY_HEADER_SIZE = 13;
+    // Per-section payload sizes (used by SHM serialization)
     public static final int BINARY_STATE_PAYLOAD_SIZE = SECTION_BLOCK_COUNT * 4;
     public static final int BINARY_LIGHT_PAYLOAD_SIZE = LIGHT_NIBBLE_ARRAY_SIZE * 2;
-    public static final int BINARY_PAYLOAD_SIZE = BINARY_STATE_PAYLOAD_SIZE + BINARY_LIGHT_PAYLOAD_SIZE;
-    public static final byte BINARY_TYPE_SUBCHUNK = 0x01;
-    public static final byte BINARY_TYPE_SUBCHUNK_GZIP = 0x02;
+    public static final byte BINARY_TYPE_FULL_CHUNK_DUMP = 0x03;
+    public static final int FULL_CHUNK_DUMP_HEADER_SIZE = 9;
+    private static final int PRISMARINE_MIN_Y = -64;
+    private static final int PRISMARINE_MAX_Y = 320;
+    private static final int PRISMARINE_SECTION_COUNT = (PRISMARINE_MAX_Y - PRISMARINE_MIN_Y) / 16;
+    private static final int PRISMARINE_BIOME_SAMPLE_COUNT = 64;
+    private static final int PRISMARINE_MIN_BLOCK_BITS = 4;
+    private static final int PRISMARINE_MAX_BLOCK_PALETTE_BITS = 8;
+    private static final int PRISMARINE_MIN_BIOME_BITS = 1;
+    private static final int PRISMARINE_MAX_BIOME_PALETTE_BITS = 3;
+    // Matches the pinned viewer runtime (minecraft-data / prismarine-chunk 1.21.11+).
+    private static final int PRISMARINE_DEFAULT_BIOME_ID = 40;
+    private static final Map<String, Integer> PRISMARINE_BIOME_IDS = Map.ofEntries(
+            Map.entry("badlands", 0),
+            Map.entry("bamboo_jungle", 1),
+            Map.entry("basalt_deltas", 2),
+            Map.entry("beach", 3),
+            Map.entry("birch_forest", 4),
+            Map.entry("cherry_grove", 5),
+            Map.entry("cold_ocean", 6),
+            Map.entry("crimson_forest", 7),
+            Map.entry("dark_forest", 8),
+            Map.entry("deep_cold_ocean", 9),
+            Map.entry("deep_dark", 10),
+            Map.entry("deep_frozen_ocean", 11),
+            Map.entry("deep_lukewarm_ocean", 12),
+            Map.entry("deep_ocean", 13),
+            Map.entry("desert", 14),
+            Map.entry("dripstone_caves", 15),
+            Map.entry("end_barrens", 16),
+            Map.entry("end_highlands", 17),
+            Map.entry("end_midlands", 18),
+            Map.entry("eroded_badlands", 19),
+            Map.entry("flower_forest", 20),
+            Map.entry("forest", 21),
+            Map.entry("frozen_ocean", 22),
+            Map.entry("frozen_peaks", 23),
+            Map.entry("frozen_river", 24),
+            Map.entry("grove", 25),
+            Map.entry("ice_spikes", 26),
+            Map.entry("jagged_peaks", 27),
+            Map.entry("jungle", 28),
+            Map.entry("lukewarm_ocean", 29),
+            Map.entry("lush_caves", 30),
+            Map.entry("mangrove_swamp", 31),
+            Map.entry("meadow", 32),
+            Map.entry("mushroom_fields", 33),
+            Map.entry("nether_wastes", 34),
+            Map.entry("ocean", 35),
+            Map.entry("old_growth_birch_forest", 36),
+            Map.entry("old_growth_pine_taiga", 37),
+            Map.entry("old_growth_spruce_taiga", 38),
+            Map.entry("pale_garden", 39),
+            Map.entry("plains", 40),
+            Map.entry("river", 41),
+            Map.entry("savanna", 42),
+            Map.entry("savanna_plateau", 43),
+            Map.entry("small_end_islands", 44),
+            Map.entry("snowy_beach", 45),
+            Map.entry("snowy_plains", 46),
+            Map.entry("snowy_slopes", 47),
+            Map.entry("snowy_taiga", 48),
+            Map.entry("soul_sand_valley", 49),
+            Map.entry("sparse_jungle", 50),
+            Map.entry("stony_peaks", 51),
+            Map.entry("stony_shore", 52),
+            Map.entry("sunflower_plains", 53),
+            Map.entry("swamp", 54),
+            Map.entry("taiga", 55),
+            Map.entry("the_end", 56),
+            Map.entry("the_void", 57),
+            Map.entry("warm_ocean", 58),
+            Map.entry("warped_forest", 59),
+            Map.entry("windswept_forest", 60),
+            Map.entry("windswept_gravelly_hills", 61),
+            Map.entry("windswept_hills", 62),
+            Map.entry("windswept_savanna", 63),
+            Map.entry("wooded_badlands", 64)
+    );
+
 
     /**
-     * Serialize all non-empty sections of a chunk snapshot into binary subchunk messages.
-     * Each message is a byte[] with a 13-byte header + 16,384 bytes of stateId data.
-     * Requires NMS stateId resolution to be available.
-     *
-     * @param snapshot the chunk snapshot (must be obtained on the main thread)
-     * @return list of byte arrays, one per non-empty subchunk; empty list if stateId not available
+     * Serialize a full chunk column as a single prismarine-chunk dump() compatible frame.
+     * Frame format:
+     *   byte 0:    type = 0x03 (full chunk dump)
+     *   bytes 1-4: chunkX (int32 LE)
+     *   bytes 5-8: chunkZ (int32 LE)
+     *   bytes 9..: raw prismarine-chunk dump bytes
      */
-    public static List<byte[]> serializeBinary(ChunkSnapshot snapshot) {
-        if (!stateIdAvailable) return Collections.emptyList();
+    public static byte[] serializeFullChunkDump(ChunkSnapshot snapshot) {
+        if (!stateIdAvailable) return null;
 
-        List<byte[]> messages = new ArrayList<>();
-        int chunkX = snapshot.getX();
-        int chunkZ = snapshot.getZ();
-
-        int minY = -64;
-        int maxY = 320;
-
-        for (int sectionY = minY >> 4; sectionY < (maxY >> 4); sectionY++) {
-            byte[] binary = serializeSectionBinary(snapshot, chunkX, chunkZ, sectionY);
-            if (binary != null) {
-                messages.add(binary);
-            }
-        }
-        return messages;
-    }
-
-    /**
-     * Serialize a single 16x16x16 section as binary stateIds.
-     * Returns null if the section is entirely air or stateId resolution fails.
-     */
-    private static byte[] serializeSectionBinary(ChunkSnapshot snapshot, int chunkX, int chunkZ, int sectionY) {
-        SectionBinaryData sectionData = scanSectionBinaryData(snapshot, sectionY);
-        if (sectionData.allAir) return null;
-
-        // Build binary message: header + stateIds + light arrays
-        ByteBuffer buf = ByteBuffer.allocate(BINARY_HEADER_SIZE + BINARY_PAYLOAD_SIZE);
-        buf.order(ByteOrder.LITTLE_ENDIAN);
-
-        // Header
-        buf.put(BINARY_TYPE_SUBCHUNK);
-        buf.putInt(chunkX);
-        buf.putInt(chunkZ);
-        buf.putInt(sectionY);
-
-        for (int i = 0; i < SECTION_BLOCK_COUNT; i++) {
-            buf.putInt(sectionData.stateIds[i]);
-        }
-        buf.put(sectionData.skyLight);
-        buf.put(sectionData.blockLight);
-
+        byte[] dump = serializePrismarineChunkDump(snapshot);
+        ByteBuffer buf = ByteBuffer.allocate(FULL_CHUNK_DUMP_HEADER_SIZE + dump.length).order(ByteOrder.LITTLE_ENDIAN);
+        buf.put(BINARY_TYPE_FULL_CHUNK_DUMP);
+        buf.putInt(snapshot.getX());
+        buf.putInt(snapshot.getZ());
+        buf.put(dump);
         return buf.array();
     }
 
-    /**
-     * Wrap a raw binary subchunk frame in a gzip-compressed transport frame.
-     * Output format:
-     *   byte 0: 0x02 (gzip-compressed subchunk)
-     *   bytes 1..N: gzip payload of the original 0x01 frame
-     */
-    public static byte[] gzipBinaryFrame(byte[] rawFrame) {
-        if (rawFrame == null || rawFrame.length == 0) {
-            return rawFrame;
+    private static byte[] serializePrismarineChunkDump(ChunkSnapshot snapshot) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(PRISMARINE_SECTION_COUNT * 512);
+        for (int sectionY = PRISMARINE_MIN_Y >> 4; sectionY < (PRISMARINE_MAX_Y >> 4); sectionY++) {
+            PrismarineSectionData sectionData = scanPrismarineSectionData(snapshot, sectionY);
+            writeShortBE(out, sectionData.solidBlockCount);
+            writePrismarinePaletteContainer(
+                    out,
+                    sectionData.stateIds,
+                    PRISMARINE_MIN_BLOCK_BITS,
+                    PRISMARINE_MAX_BLOCK_PALETTE_BITS
+            );
+            writePrismarinePaletteContainer(
+                    out,
+                    scanPrismarineBiomeIds(snapshot, sectionY),
+                    PRISMARINE_MIN_BIOME_BITS,
+                    PRISMARINE_MAX_BIOME_PALETTE_BITS
+            );
         }
-        try {
-            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-            out.write(BINARY_TYPE_SUBCHUNK_GZIP);
-            try (GZIPOutputStream gzip = new GZIPOutputStream(out)) {
-                gzip.write(rawFrame);
-            }
-            return out.toByteArray();
-        } catch (java.io.IOException e) {
-            return rawFrame;
-        }
+        return out.toByteArray();
     }
 
-    /**
-     * Inflate a gzip-compressed subchunk frame back to the original raw 0x01 frame.
-     * If the frame is not gzip-wrapped, it is returned unchanged.
-     */
-    public static byte[] inflateBinaryFrame(byte[] frame) throws java.io.IOException {
-        if (frame == null || frame.length == 0 || frame[0] != BINARY_TYPE_SUBCHUNK_GZIP) {
-            return frame;
-        }
-        try (GZIPInputStream gzip = new GZIPInputStream(new java.io.ByteArrayInputStream(frame, 1, frame.length - 1));
-             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream()) {
-            gzip.transferTo(out);
-            return out.toByteArray();
-        }
-    }
-
-    /**
-     * Serialize a single 16x16x16 section.
-     * Returns null if the section is entirely air.
-     */
-    private static String serializeSection(ChunkSnapshot snapshot, int chunkX, int chunkZ, int sectionY) {
+    private static PrismarineSectionData scanPrismarineSectionData(ChunkSnapshot snapshot, int sectionY) {
         int baseY = sectionY * 16;
+        int[] stateIds = new int[SECTION_BLOCK_COUNT];
+        int solidBlockCount = 0;
+        int firstValue = Integer.MIN_VALUE;
+        boolean singleValue = true;
 
-        // Build palette and indices in XZY order (matching bridge format)
-        Map<String, Integer> paletteMap = new LinkedHashMap<>();
-        List<PaletteEntry> paletteList = new ArrayList<>();
-        int[] indices = new int[4096];
-        boolean allAir = true;
+        for (int localY = 0; localY < 16; localY++) {
+            int blockY = baseY + localY;
+            for (int localZ = 0; localZ < 16; localZ++) {
+                for (int localX = 0; localX < 16; localX++) {
+                    int stateId = 0;
+                    try {
+                        BlockData blockData = snapshot.getBlockData(localX, blockY, localZ);
+                        if (blockData != null) {
+                            int sid = getStateId(blockData);
+                            if (sid >= 0) {
+                                stateId = sid;
+                            }
+                        }
+                    } catch (Exception ignored) {
+                    }
 
-        for (int i = 0; i < 4096; i++) {
-            // XZY order matching bridge decodeSubChunkIndex: x=(i>>8), z=(i>>4), y=i&0xF
-            int x = (i >> 8) & 0xF;
-            int z = (i >> 4) & 0xF;
-            int y = i & 0xF;
-            int blockY = baseY + y;
-
-            BlockData blockData;
-            try {
-                blockData = snapshot.getBlockData(x, blockY, z);
-            } catch (Exception e) {
-                // Out of bounds for this snapshot (e.g. nether ceiling)
-                blockData = null;
-            }
-
-            String blockDataStr = blockData != null ? blockData.getAsString() : "minecraft:air";
-
-            if (!"minecraft:air".equals(blockDataStr)) {
-                allAir = false;
-            }
-
-            Integer paletteIndex = paletteMap.get(blockDataStr);
-            if (paletteIndex == null) {
-                paletteIndex = paletteMap.size();
-                paletteMap.put(blockDataStr, paletteIndex);
-
-                // Get stateId if available
-                int sid = -1;
-                if (blockData != null && stateIdAvailable) {
-                    sid = getStateId(blockData);
+                    int index = (localY << 8) | (localZ << 4) | localX;
+                    stateIds[index] = stateId;
+                    if (stateId != 0) solidBlockCount++;
+                    if (firstValue == Integer.MIN_VALUE) {
+                        firstValue = stateId;
+                    } else if (stateId != firstValue) {
+                        singleValue = false;
+                    }
                 }
-                paletteList.add(parseBlockData(blockDataStr, paletteIndex, sid));
             }
-            indices[i] = paletteIndex;
         }
 
-        if (allAir) {
-            return null;
-        }
-
-        // Build JSON
-        JsonObject msg = new JsonObject();
-        msg.addProperty("type", "subchunk");
-        msg.addProperty("x", chunkX);
-        msg.addProperty("y", sectionY);
-        msg.addProperty("z", chunkZ);
-
-        JsonArray paletteArray = new JsonArray();
-        for (PaletteEntry entry : paletteList) {
-            paletteArray.add(entry.toJson());
-        }
-        msg.add("palette", paletteArray);
-        msg.addProperty("indices", indicesToBase64(indices, paletteList.size()));
-
-        return msg.toString();
+        return new PrismarineSectionData(stateIds, solidBlockCount, firstValue == Integer.MIN_VALUE ? 0 : firstValue, singleValue);
     }
 
-    /**
-     * Serialize a single 16x16x16 section's biome lattice (4x4x4 cells).
-     * Returns null if the sampled section is entirely out of bounds.
-     */
-    private static String serializeBiomeSection(ChunkSnapshot snapshot, int chunkX, int chunkZ, int sectionY) {
+    private static int[] scanPrismarineBiomeIds(ChunkSnapshot snapshot, int sectionY) {
         int baseY = sectionY * 16;
-
-        Map<String, Integer> paletteMap = new LinkedHashMap<>();
-        List<BiomePaletteEntry> paletteList = new ArrayList<>();
-        int[] indices = new int[64];
-        boolean hasBiomeData = false;
-
-        for (int i = 0; i < 64; i++) {
-            int x = i & 0x3;
-            int z = (i >> 2) & 0x3;
-            int y = (i >> 4) & 0x3;
-
-            int blockX = x << 2;
-            int blockY = baseY + (y << 2);
-            int blockZ = z << 2;
-
-            Biome biome;
-            try {
-                biome = snapshot.getBiome(blockX, blockY, blockZ);
-                hasBiomeData = true;
-            } catch (Exception e) {
-                biome = null;
+        int[] biomeIds = new int[PRISMARINE_BIOME_SAMPLE_COUNT];
+        for (int localBiomeY = 0; localBiomeY < 4; localBiomeY++) {
+            int blockY = baseY + (localBiomeY << 2);
+            for (int localBiomeZ = 0; localBiomeZ < 4; localBiomeZ++) {
+                for (int localBiomeX = 0; localBiomeX < 4; localBiomeX++) {
+                    String biomeName;
+                    try {
+                        biomeName = normalizeBiomeName(snapshot.getBiome(localBiomeX << 2, blockY, localBiomeZ << 2));
+                    } catch (Exception ignored) {
+                        biomeName = "minecraft:plains";
+                    }
+                    int index = (localBiomeY << 4) | (localBiomeZ << 2) | localBiomeX;
+                    biomeIds[index] = resolvePrismarineBiomeId(biomeName);
+                }
             }
+        }
+        return biomeIds;
+    }
 
-            String biomeName = normalizeBiomeName(biome);
-            Integer paletteIndex = paletteMap.get(biomeName);
+    private static void writePrismarinePaletteContainer(
+            ByteArrayOutputStream out,
+            int[] values,
+            int minBitsPerValue,
+            int maxPaletteBits
+    ) {
+        if (values.length == 0) {
+            out.write(0);
+            writeVarInt(out, 0);
+            return;
+        }
+
+        int firstValue = values[0];
+        boolean singleValue = true;
+        int maxValue = firstValue;
+        List<Integer> palette = new ArrayList<>();
+        Map<Integer, Integer> paletteIndexes = new HashMap<>();
+        int[] paletteData = new int[values.length];
+        int maxPaletteSize = 1 << maxPaletteBits;
+        boolean useIndirectPalette = true;
+
+        palette.add(firstValue);
+        paletteIndexes.put(firstValue, 0);
+        paletteData[0] = 0;
+
+        for (int i = 1; i < values.length; i++) {
+            int value = values[i];
+            if (value != firstValue) singleValue = false;
+            if (value > maxValue) maxValue = value;
+            if (!useIndirectPalette) continue;
+
+            Integer paletteIndex = paletteIndexes.get(value);
             if (paletteIndex == null) {
-                paletteIndex = paletteMap.size();
-                paletteMap.put(biomeName, paletteIndex);
-                paletteList.add(new BiomePaletteEntry(paletteIndex, biomeName));
+                if (palette.size() >= maxPaletteSize) {
+                    useIndirectPalette = false;
+                    continue;
+                }
+                paletteIndex = palette.size();
+                palette.add(value);
+                paletteIndexes.put(value, paletteIndex);
             }
-            indices[i] = paletteIndex;
+            paletteData[i] = paletteIndex;
         }
 
-        if (!hasBiomeData) {
-            return null;
+        if (singleValue) {
+            out.write(0);
+            writeVarInt(out, firstValue);
+            return;
         }
 
-        JsonObject msg = new JsonObject();
-        msg.addProperty("type", "biomes");
-        msg.addProperty("x", chunkX);
-        msg.addProperty("y", sectionY);
-        msg.addProperty("z", chunkZ);
-
-        JsonArray biomeArray = new JsonArray();
-        for (BiomePaletteEntry entry : paletteList) {
-            biomeArray.add(entry.toJson());
+        if (useIndirectPalette) {
+            int bitsPerValue = Math.max(minBitsPerValue, neededBits(palette.size() - 1));
+            out.write(bitsPerValue);
+            writeVarInt(out, palette.size());
+            for (int paletteValue : palette) {
+                writeVarInt(out, paletteValue);
+            }
+            writePackedValues(out, paletteData, bitsPerValue);
+            return;
         }
-        msg.add("biomes", biomeArray);
-        msg.addProperty("biomeIndices", indicesToBase64(indices, paletteList.size()));
 
-        return msg.toString();
+        int bitsPerValue = Math.max(minBitsPerValue, neededBits(maxValue));
+        out.write(bitsPerValue);
+        writePackedValues(out, values, bitsPerValue);
     }
 
-    /**
-     * Parse a block data string like "minecraft:oak_stairs[facing=north,half=bottom]"
-     * into a PaletteEntry with name, states, and optional stateId.
-     */
-    private static PaletteEntry parseBlockData(String blockData, int index, int stateId) {
-        int bracketStart = blockData.indexOf('[');
-        if (bracketStart == -1) {
-            return new PaletteEntry(index, blockData, Collections.emptyMap(), stateId);
+    private static int resolvePrismarineBiomeId(String biomeName) {
+        if (biomeName == null || biomeName.isBlank()) {
+            return PRISMARINE_DEFAULT_BIOME_ID;
         }
-
-        String name = blockData.substring(0, bracketStart);
-        String statesStr = blockData.substring(bracketStart + 1, blockData.length() - 1);
-        Map<String, String> states = new LinkedHashMap<>();
-        for (String pair : statesStr.split(",")) {
-            String[] kv = pair.split("=", 2);
-            if (kv.length == 2) {
-                states.put(kv[0], kv[1]);
-            }
-        }
-        return new PaletteEntry(index, name, states, stateId);
+        String normalized = biomeName.startsWith("minecraft:")
+                ? biomeName.substring("minecraft:".length())
+                : biomeName;
+        return PRISMARINE_BIOME_IDS.getOrDefault(normalized, PRISMARINE_DEFAULT_BIOME_ID);
     }
+
+    private static int neededBits(int value) {
+        if (value <= 0) return 0;
+        return Integer.SIZE - Integer.numberOfLeadingZeros(value);
+    }
+
+    private static void writeShortBE(ByteArrayOutputStream out, int value) {
+        out.write((value >>> 8) & 0xFF);
+        out.write(value & 0xFF);
+    }
+
+    private static void writeVarInt(ByteArrayOutputStream out, int value) {
+        int remaining = value;
+        do {
+            int next = remaining & 0x7F;
+            remaining >>>= 7;
+            if (remaining != 0) {
+                next |= 0x80;
+            }
+            out.write(next);
+        } while (remaining != 0);
+    }
+
+    private static void writePackedValues(ByteArrayOutputStream out, int[] values, int bitsPerValue) {
+        int valuesPerLong = Math.max(1, 64 / bitsPerValue);
+        long valueMask = (1L << bitsPerValue) - 1L;
+
+        for (int baseIndex = 0; baseIndex < values.length; baseIndex += valuesPerLong) {
+            long packed = 0L;
+            for (int offset = 0; offset < valuesPerLong; offset++) {
+                int valueIndex = baseIndex + offset;
+                if (valueIndex >= values.length) break;
+                long value = Integer.toUnsignedLong(values[valueIndex]) & valueMask;
+                packed |= value << (offset * bitsPerValue);
+            }
+            writeLongBE(out, packed);
+        }
+    }
+
+    private static void writeLongBE(ByteArrayOutputStream out, long value) {
+        out.write((int) ((value >>> 56) & 0xFF));
+        out.write((int) ((value >>> 48) & 0xFF));
+        out.write((int) ((value >>> 40) & 0xFF));
+        out.write((int) ((value >>> 32) & 0xFF));
+        out.write((int) ((value >>> 24) & 0xFF));
+        out.write((int) ((value >>> 16) & 0xFF));
+        out.write((int) ((value >>> 8) & 0xFF));
+        out.write((int) (value & 0xFF));
+    }
+
 
     private static String normalizeBiomeName(Biome biome) {
         if (biome == null) {
@@ -450,26 +436,6 @@ public class ChunkSerializer {
         }
     }
 
-    /**
-     * Encode indices as base64 (uint8 if palette <= 256, uint16 LE otherwise).
-     * Matches the Go bot's indicesToBase64 function.
-     */
-    private static String indicesToBase64(int[] indices, int paletteLen) {
-        byte[] buf;
-        if (paletteLen <= 256) {
-            buf = new byte[indices.length];
-            for (int i = 0; i < indices.length; i++) {
-                buf[i] = (byte) indices[i];
-            }
-        } else {
-            buf = new byte[indices.length * 2];
-            for (int i = 0; i < indices.length; i++) {
-                buf[i * 2] = (byte) (indices[i] & 0xFF);
-                buf[i * 2 + 1] = (byte) ((indices[i] >> 8) & 0xFF);
-            }
-        }
-        return Base64.getEncoder().encodeToString(buf);
-    }
 
     /**
      * Serialize a heightmap message for a chunk column.
@@ -656,13 +622,18 @@ public class ChunkSerializer {
         return material.getKey().toString();
     }
 
+    static boolean isTrackedBlockEntityMaterial(Material material) {
+        return isTrackedBlockEntityId(materialToBlockId(material));
+    }
+
     private static boolean isTrackedBlockEntityId(String blockId) {
         return isChestId(blockId)
             || "minecraft:enchanting_table".equals(blockId)
             || isSignId(blockId)
             || isBannerId(blockId)
             || isSkullId(blockId)
-            || isBedId(blockId);
+            || isBedId(blockId)
+            || isShulkerBoxId(blockId);
     }
 
     private static boolean isChestId(String blockId) {
@@ -679,6 +650,10 @@ public class ChunkSerializer {
 
     private static boolean isSkullId(String blockId) {
         return blockId.endsWith("_head") || blockId.endsWith("_skull");
+    }
+
+    private static boolean isShulkerBoxId(String blockId) {
+        return blockId.endsWith("shulker_box");
     }
 
     private static boolean isBedId(String blockId) {
@@ -705,11 +680,26 @@ public class ChunkSerializer {
 
     // ---- Shared Memory (SHM) Chunk Writing ----
 
-    private static final java.nio.file.Path SHM_DIR = java.nio.file.Paths.get("/dev/shm/mindaxis-chunks");
+    private static final java.nio.file.Path DEFAULT_SHARED_DATA_DIR = java.nio.file.Paths.get(
+            System.getProperty("java.io.tmpdir"),
+            "craftlink",
+            "chunks"
+    );
+    private static volatile java.nio.file.Path sharedDataDir = DEFAULT_SHARED_DATA_DIR;
     private static volatile boolean shmDirCreated = false;
+    private static volatile java.nio.file.Path shmDirOverrideForTest;
+    private static final ConcurrentHashMap<String, Object> shmChunkLocks = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong> shmMutationSequences =
+            new ConcurrentHashMap<>();
+
+    public enum ShmUpdateResult {
+        UPDATED,
+        NOOP,
+        REWRITE_REQUIRED
+    }
 
     /**
-     * Serialize a chunk snapshot to /dev/shm/mindaxis-chunks/{cx}_{cz} as raw stateId + light arrays.
+     * Serialize a chunk snapshot to {shared-data-root}/chunks/{cx}_{cz} as raw stateId + light arrays.
      *
      * Binary format (little-endian):
      *   4 bytes: number of non-air sections (int32)
@@ -726,12 +716,19 @@ public class ChunkSerializer {
      * @param manifestEntries thread-safe set of all written chunk keys for manifest updates
      */
     public static void serializeToShm(ChunkSnapshot snapshot, Set<String> manifestEntries) {
+        serializeToShm(snapshot, manifestEntries, reserveShmMutation(snapshot.getX(), snapshot.getZ()));
+    }
+
+    public static void serializeToShm(ChunkSnapshot snapshot, Set<String> manifestEntries, long mutationSequence) {
         if (!stateIdAvailable) return;
 
         int cx = snapshot.getX();
         int cz = snapshot.getZ();
         int minY = -64;
         int maxY = 320;
+        String chunkKey = shmChunkKey(cx, cz);
+        java.nio.file.Path shmDir = resolveShmDir();
+        if (!isCurrentShmMutation(chunkKey, mutationSequence)) return;
 
         List<SectionBinaryData> sectionData = new ArrayList<>();
 
@@ -742,13 +739,28 @@ public class ChunkSerializer {
             }
         }
 
-        if (sectionData.isEmpty()) return;
+        if (sectionData.isEmpty()) {
+            synchronized (shmChunkLock(chunkKey)) {
+                if (!isCurrentShmMutation(chunkKey, mutationSequence)) return;
+                try {
+                    java.nio.file.Files.deleteIfExists(shmDir.resolve(chunkKey));
+                } catch (Exception ignored) {
+                }
+                manifestEntries.remove(chunkKey);
+                if (java.nio.file.Files.exists(shmDir)) {
+                    updateManifest(manifestEntries);
+                }
+            }
+            return;
+        }
 
         // Ensure directory exists
         if (!shmDirCreated) {
             try {
-                java.nio.file.Files.createDirectories(SHM_DIR);
-                shmDirCreated = true;
+                java.nio.file.Files.createDirectories(shmDir);
+                if (shmDirOverrideForTest == null) {
+                    shmDirCreated = true;
+                }
             } catch (Exception e) {
                 return; // Can't write
             }
@@ -773,17 +785,101 @@ public class ChunkSerializer {
         }
 
         // Write chunk file
-        String chunkKey = cx + "_" + cz;
-        java.nio.file.Path chunkFile = SHM_DIR.resolve(chunkKey);
-        try {
-            java.nio.file.Files.write(chunkFile, buf.array());
-        } catch (Exception e) {
-            return;
+        java.nio.file.Path chunkFile = shmDir.resolve(chunkKey);
+        synchronized (shmChunkLock(chunkKey)) {
+            if (!isCurrentShmMutation(chunkKey, mutationSequence)) return;
+            try {
+                java.nio.file.Files.write(chunkFile, buf.array());
+            } catch (Exception e) {
+                return;
+            }
+
+            // Update manifest atomically (write to tmp, rename)
+            manifestEntries.add(chunkKey);
+            updateManifest(manifestEntries);
+        }
+    }
+
+    public static long reserveShmMutation(int chunkX, int chunkZ) {
+        return shmMutationSequences
+                .computeIfAbsent(shmChunkKey(chunkX, chunkZ), ignored -> new java.util.concurrent.atomic.AtomicLong())
+                .incrementAndGet();
+    }
+
+    public static ShmUpdateResult updateShmBlock(int blockX, int blockY, int blockZ, int stateId) {
+        return updateShmBlock(
+                blockX,
+                blockY,
+                blockZ,
+                stateId,
+                reserveShmMutation(Math.floorDiv(blockX, 16), Math.floorDiv(blockZ, 16))
+        );
+    }
+
+    static ShmUpdateResult updateShmBlock(int blockX, int blockY, int blockZ, int stateId, long mutationSequence) {
+        if (stateId < 0) return ShmUpdateResult.NOOP;
+
+        int chunkX = Math.floorDiv(blockX, 16);
+        int chunkZ = Math.floorDiv(blockZ, 16);
+        String chunkKey = shmChunkKey(chunkX, chunkZ);
+        if (!isCurrentShmMutation(chunkKey, mutationSequence)) return ShmUpdateResult.NOOP;
+
+        java.nio.file.Path chunkFile = resolveShmDir().resolve(chunkKey);
+        if (!java.nio.file.Files.exists(chunkFile)) {
+            return stateId == 0 ? ShmUpdateResult.NOOP : ShmUpdateResult.REWRITE_REQUIRED;
         }
 
-        // Update manifest atomically (write to tmp, rename)
-        manifestEntries.add(chunkKey);
-        updateManifest(manifestEntries);
+        int sectionY = blockY >> 4;
+        int localX = Math.floorMod(blockX, 16);
+        int localY = blockY & 0xF;
+        int localZ = Math.floorMod(blockZ, 16);
+        int targetIndex = (localX << 8) | (localZ << 4) | localY;
+        int perSectionSize = 4 + BINARY_STATE_PAYLOAD_SIZE + BINARY_LIGHT_PAYLOAD_SIZE;
+
+        synchronized (shmChunkLock(chunkKey)) {
+            if (!isCurrentShmMutation(chunkKey, mutationSequence)) return ShmUpdateResult.NOOP;
+            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(chunkFile.toFile(), "rw")) {
+                if (raf.length() < 4) {
+                    return stateId == 0 ? ShmUpdateResult.NOOP : ShmUpdateResult.REWRITE_REQUIRED;
+                }
+
+                int numSections = readLittleEndianInt(raf);
+                if (numSections <= 0 || numSections > 24) {
+                    return stateId == 0 ? ShmUpdateResult.NOOP : ShmUpdateResult.REWRITE_REQUIRED;
+                }
+
+                long offset = 4L;
+                for (int sectionIndex = 0; sectionIndex < numSections; sectionIndex++) {
+                    raf.seek(offset);
+                    int currentSectionY = readLittleEndianInt(raf);
+                    if (currentSectionY != sectionY) {
+                        offset += perSectionSize;
+                        continue;
+                    }
+
+                    long sectionStateOffset = offset + 4L;
+                    long stateOffset = sectionStateOffset + (long) targetIndex * 4L;
+                    raf.seek(stateOffset);
+                    int currentStateId = readLittleEndianInt(raf);
+                    if (currentStateId == stateId) {
+                        return ShmUpdateResult.NOOP;
+                    }
+                    if (stateId == 0
+                            && currentStateId != 0
+                            && sectionWouldBecomeAllAir(raf, sectionStateOffset, targetIndex)) {
+                        return ShmUpdateResult.REWRITE_REQUIRED;
+                    }
+
+                    raf.seek(stateOffset);
+                    writeLittleEndianInt(raf, stateId);
+                    return ShmUpdateResult.UPDATED;
+                }
+            } catch (Exception e) {
+                return stateId == 0 ? ShmUpdateResult.NOOP : ShmUpdateResult.REWRITE_REQUIRED;
+            }
+        }
+
+        return stateId == 0 ? ShmUpdateResult.NOOP : ShmUpdateResult.REWRITE_REQUIRED;
     }
 
     /**
@@ -792,8 +888,9 @@ public class ChunkSerializer {
     private static void updateManifest(Set<String> manifestEntries) {
         try {
             String content = String.join("\n", manifestEntries) + "\n";
-            java.nio.file.Path tmpFile = SHM_DIR.resolve("_manifest.tmp");
-            java.nio.file.Path manifestFile = SHM_DIR.resolve("_manifest");
+            java.nio.file.Path shmDir = resolveShmDir();
+            java.nio.file.Path tmpFile = shmDir.resolve("_manifest.tmp");
+            java.nio.file.Path manifestFile = shmDir.resolve("_manifest");
             java.nio.file.Files.writeString(tmpFile, content);
             java.nio.file.Files.move(tmpFile, manifestFile,
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING,
@@ -817,15 +914,47 @@ public class ChunkSerializer {
         return stateIdCache.size();
     }
 
-    static void setStateIdProviderOverrideForTest(StateIdProvider provider) {
+    static void setStateIdProvider(StateIdProvider provider) {
         stateIdProviderOverride = provider;
         stateIdAvailable = provider != null;
         stateIdCache.clear();
     }
 
-    static void clearStateIdProviderOverrideForTest() {
+    static void clearStateIdProvider() {
         stateIdProviderOverride = null;
+        stateIdAvailable = getStateMethod != null && getIdMethod != null && blockStateRegistry != null;
         stateIdCache.clear();
+    }
+
+    static void setStateIdProviderOverrideForTest(StateIdProvider provider) {
+        setStateIdProvider(provider);
+    }
+
+    static void clearStateIdProviderOverrideForTest() {
+        clearStateIdProvider();
+        stateIdCache.clear();
+    }
+
+    static void setShmDirOverrideForTest(java.nio.file.Path shmDir) {
+        shmDirOverrideForTest = shmDir;
+        shmDirCreated = false;
+        shmChunkLocks.clear();
+        shmMutationSequences.clear();
+    }
+
+    static void setSharedDataDir(java.nio.file.Path shmDir) {
+        if (shmDir == null) return;
+        sharedDataDir = shmDir;
+        shmDirCreated = false;
+        shmChunkLocks.clear();
+        shmMutationSequences.clear();
+    }
+
+    static void clearShmDirOverrideForTest() {
+        shmDirOverrideForTest = null;
+        shmDirCreated = false;
+        shmChunkLocks.clear();
+        shmMutationSequences.clear();
     }
 
     private static SectionBinaryData scanSectionBinaryData(ChunkSnapshot snapshot, int sectionY) {
@@ -875,6 +1004,50 @@ public class ChunkSerializer {
         }
     }
 
+    private static java.nio.file.Path resolveShmDir() {
+        return shmDirOverrideForTest != null ? shmDirOverrideForTest : sharedDataDir;
+    }
+
+    private static Object shmChunkLock(String chunkKey) {
+        return shmChunkLocks.computeIfAbsent(chunkKey, ignored -> new Object());
+    }
+
+    private static String shmChunkKey(int chunkX, int chunkZ) {
+        return chunkX + "_" + chunkZ;
+    }
+
+    private static boolean isCurrentShmMutation(String chunkKey, long mutationSequence) {
+        if (mutationSequence <= 0) return true;
+        java.util.concurrent.atomic.AtomicLong current = shmMutationSequences.get(chunkKey);
+        return current != null && current.get() == mutationSequence;
+    }
+
+    private static boolean sectionWouldBecomeAllAir(
+            java.io.RandomAccessFile raf,
+            long sectionStateOffset,
+            int targetIndex
+    ) throws java.io.IOException {
+        byte[] stateBytes = new byte[BINARY_STATE_PAYLOAD_SIZE];
+        raf.seek(sectionStateOffset);
+        raf.readFully(stateBytes);
+        ByteBuffer buf = ByteBuffer.wrap(stateBytes).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < SECTION_BLOCK_COUNT; i++) {
+            int stateId = buf.getInt(i * 4);
+            if (i != targetIndex && stateId != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int readLittleEndianInt(java.io.RandomAccessFile raf) throws java.io.IOException {
+        return Integer.reverseBytes(raf.readInt());
+    }
+
+    private static void writeLittleEndianInt(java.io.RandomAccessFile raf, int value) throws java.io.IOException {
+        raf.writeInt(Integer.reverseBytes(value));
+    }
+
     private static void setNibble(byte[] target, int index, int value) {
         int byteIndex = index >> 1;
         int nibble = value & 0xF;
@@ -882,40 +1055,6 @@ public class ChunkSerializer {
             target[byteIndex] = (byte) ((target[byteIndex] & 0xF0) | nibble);
         } else {
             target[byteIndex] = (byte) ((target[byteIndex] & 0x0F) | (nibble << 4));
-        }
-    }
-
-    /**
-     * A single palette entry: index + block name + optional states + optional stateId.
-     */
-    private static class PaletteEntry {
-        final int index;
-        final String name;
-        final Map<String, String> states;
-        final int stateId; // -1 if not available
-
-        PaletteEntry(int index, String name, Map<String, String> states, int stateId) {
-            this.index = index;
-            this.name = name;
-            this.states = states;
-            this.stateId = stateId;
-        }
-
-        JsonObject toJson() {
-            JsonObject obj = new JsonObject();
-            obj.addProperty("index", index);
-            obj.addProperty("name", name);
-            if (stateId >= 0) {
-                obj.addProperty("sid", stateId);
-            }
-            if (!states.isEmpty()) {
-                JsonObject statesObj = new JsonObject();
-                for (Map.Entry<String, String> e : states.entrySet()) {
-                    statesObj.addProperty(e.getKey(), e.getValue());
-                }
-                obj.add("states", statesObj);
-            }
-            return obj;
         }
     }
 
@@ -935,20 +1074,18 @@ public class ChunkSerializer {
         }
     }
 
-    private static class BiomePaletteEntry {
-        final int index;
-        final String name;
+    private static class PrismarineSectionData {
+        final int[] stateIds;
+        final int solidBlockCount;
+        final int firstValue;
+        final boolean singleValue;
 
-        BiomePaletteEntry(int index, String name) {
-            this.index = index;
-            this.name = name;
-        }
-
-        JsonObject toJson() {
-            JsonObject obj = new JsonObject();
-            obj.addProperty("index", index);
-            obj.addProperty("name", name);
-            return obj;
+        PrismarineSectionData(int[] stateIds, int solidBlockCount, int firstValue, boolean singleValue) {
+            this.stateIds = stateIds;
+            this.solidBlockCount = solidBlockCount;
+            this.firstValue = firstValue;
+            this.singleValue = singleValue;
         }
     }
+
 }
