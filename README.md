@@ -115,6 +115,29 @@ main().catch(console.error);
 - **Shared Memory** (`/dev/shm`) — Sub-millisecond local IPC
 - Auto-reconnect with exponential backoff
 
+## MindAxis Portal Integration
+
+Servers running CraftLink are automatically discovered by [MindAxis Portal](https://view.mindaxis.me/servers) — a Minecraft server discovery platform with real-time player stats and 3D browser previews.
+
+### How it works
+
+CraftLink injects an invisible marker into your server's MOTD response. The portal scanner detects this marker during regular SLP (Server List Ping) scans and adds a **3D Preview** badge to your server listing.
+
+Players can walk through your server world in their browser — no Minecraft client required. Mobile 60fps.
+
+### Configuration
+
+```yaml
+# plugins/MindAxisView/config.yml
+portal:
+  enabled: true    # Set to false to opt out of portal discovery
+  token: ""        # Optional: claim ownership of your listing
+```
+
+### Opting out
+
+Set `portal.enabled: false` in config.yml to remove the MOTD marker. Your server will still appear in the portal (via SLP scan) but without the 3D Preview badge.
+
 ## Plugin Commands
 
 ```
@@ -146,6 +169,11 @@ tracked-players:
 
 # Max history buffer (subchunks kept for late-joining clients)
 max-history: 2048
+
+# Portal integration (MindAxis Portal server discovery)
+portal:
+  enabled: true       # Inject MOTD marker for automatic discovery
+  token: ""           # Claim token for server ownership verification
 ```
 
 ## Supported Versions
